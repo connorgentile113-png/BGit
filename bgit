@@ -1,0 +1,991 @@
+#!/usr/bin/env bash
+#
+# BGit - Better Git
+# A cleaner, friendlier wrapper around git with auto merge-conflict resolution.
+#
+# Author: Connor Gentile
+# Repo:   https://github.com/connorgentile113-png/BGit
+# License: MIT
+#
+
+set -uo pipefail
+
+VERSION="1.0.0"
+
+# ─── Colors ─────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ─── Icons ──────────────────────────────────────────────────────────────────
+CHECK="✅"
+CROSS="❌"
+WARN="⚠️"
+INFO="ℹ️"
+ROCKET="🚀"
+BRANCH_ICON="🌿"
+MERGE_ICON="🔀"
+CONFLICT_ICON="💥"
+PUSH_ICON="⬆️"
+PULL_ICON="⬇️"
+SPARKLE="✨"
+LOCK="🔒"
+
+# ─── Print Helpers ──────────────────────────────────────────────────────────
+print_info()    { echo -e "${BLUE}${INFO}${NC}  $1"; }
+print_success() { echo -e "${GREEN}${CHECK}${NC} $1"; }
+print_warn()    { echo -e "${YELLOW}${WARN}${NC}  $1"; }
+print_error()   { echo -e "${RED}${CROSS}${NC} $1" >&2; }
+print_header()  { echo -e "\n${BOLD}${PURPLE}${ROCKET} $1${NC}\n"; }
+print_step()    { echo -e "  ${CYAN}→${NC} $1"; }
+print_dim()     { echo -e "  ${DIM}$1${NC}"; }
+
+# ─── Utilities ──────────────────────────────────────────────────────────────
+require_git() {
+    if ! command -v git &>/dev/null; then
+        print_error "Git is not installed on this system."
+        print_info  "Install git first:  https://git-scm.com/downloads"
+        exit 1
+    fi
+}
+
+in_git_repo() {
+    git rev-parse --is-inside-work-tree &>/dev/null
+}
+
+current_branch() {
+    git branch --show-current 2>/dev/null || echo "detached"
+}
+
+# Get list of files with conflict markers
+conflicted_files() {
+    git diff --name-only --diff-filter=U 2>/dev/null
+}
+
+# Check if any conflicts exist
+has_conflicts() {
+    local count
+    count=$(git diff --name-only --diff-filter=U 2>/dev/null | wc -l)
+    [[ "$count" -gt 0 ]]
+}
+
+# Run a git command, capturing output quietly
+git_quiet() {
+    git "$@" 2>/dev/null
+}
+
+# ─── Command: init ──────────────────────────────────────────────────────────
+cmd_init() {
+    print_header "Initializing a new Git repository"
+    if in_git_repo; then
+        print_warn "This directory is already a Git repository."
+        return 0
+    fi
+    git init
+    print_success "Repository initialized in $(pwd)"
+    print_step "Setting up sensible defaults..."
+    git_quiet config user.name 2>/dev/null || true
+    # Set friendly defaults
+    git config init.defaultBranch main 2>/dev/null || true
+    git config pull.rebase false 2>/dev/null || true
+    print_success "Defaults configured."
+    echo
+    print_info "Next steps:"
+    print_dim "  bgit add .         — stage your files"
+    print_dim "  bgit commit -m \"Initial commit\""
+    echo
+}
+
+# ─── Command: status ────────────────────────────────────────────────────────
+cmd_status() {
+    print_header "Repository Status"
+
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        print_info  "Run ${BOLD}bgit init${NC} to create one."
+        exit 1
+    fi
+
+    local branch
+    branch=$(current_branch)
+    echo -e "  ${BRANCH_ICON} Branch: ${BOLD}${branch}${NC}"
+
+    # Upstream tracking
+    local upstream
+    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+    if [[ -n "$upstream" ]]; then
+        echo -e "  ${PULL_ICON} Tracking: ${upstream}"
+        # Ahead / behind
+        local ahead behind
+        ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+        behind=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+        if [[ "$ahead" -gt 0 ]] || [[ "$behind" -gt 0 ]]; then
+            echo -e "  ${PUSH_ICON} Ahead by ${BOLD}${ahead}${NC}  ${PULL_ICON} Behind by ${BOLD}${behind}${NC}"
+        else
+            print_success "Up to date with remote."
+        fi
+    else
+        print_warn "No upstream branch configured."
+    fi
+    echo
+
+    # Staged
+    local staged
+    staged=$(git diff --cached --name-only 2>/dev/null)
+    if [[ -n "$staged" ]]; then
+        echo -e "  ${GREEN}${BOLD}Staged files:${NC}"
+        while IFS= read -r f; do
+            echo -e "    ${GREEN}+${NC} $f"
+        done <<< "$staged"
+        echo
+    fi
+
+    # Modified (unstaged)
+    local modified
+    modified=$(git diff --name-only 2>/dev/null)
+    if [[ -n "$modified" ]]; then
+        echo -e "  ${YELLOW}${BOLD}Modified (unstaged):${NC}"
+        while IFS= read -r f; do
+            echo -e "    ${YELLOW}~${NC} $f"
+        done <<< "$modified"
+        echo
+    fi
+
+    # Untracked
+    local untracked
+    untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
+    if [[ -n "$untracked" ]]; then
+        echo -e "  ${GRAY}${BOLD}Untracked:${NC}"
+        while IFS= read -r f; do
+            echo -e "    ${GRAY}?${NC} $f"
+        done <<< "$untracked"
+        echo
+    fi
+
+    # Conflicts
+    if has_conflicts; then
+        echo -e "  ${RED}${BOLD}${CONFLICT_ICON} Conflicted files:${NC}"
+        conflicted_files | while IFS= read -r f; do
+            echo -e "    ${RED}!${NC} $f"
+        done
+        echo
+        print_warn "You have unresolved merge conflicts."
+        print_info "Run ${BOLD}bgit resolve${NC} to auto-resolve them."
+        return
+    fi
+
+    # Clean state
+    if [[ -z "$staged" ]] && [[ -z "$modified" ]] && [[ -z "$untracked" ]]; then
+        print_success "Working tree is clean. Nothing to do. 🎉"
+    fi
+}
+
+# ─── Command: add ───────────────────────────────────────────────────────────
+cmd_add() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local target="${1:-.}"
+
+    if [[ "$target" == "." || "$target" == "--all" || "$target" == "-A" ]]; then
+        print_header "Staging all changes"
+        git add -A
+        local count
+        count=$(git diff --cached --name-only | wc -l)
+        print_success "Staged ${count} file(s)."
+    else
+        print_header "Staging: $target"
+        if git add "$target" 2>/dev/null; then
+            print_success "Staged: $target"
+        else
+            print_error "Could not stage: $target"
+            exit 1
+        fi
+    fi
+}
+
+# ─── Command: commit ────────────────────────────────────────────────────────
+cmd_commit() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local message=""
+    local auto_stage=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--message)
+                message="$2"
+                shift 2
+                ;;
+            -a|--all)
+                auto_stage=true
+                shift
+                ;;
+            *)
+                if [[ -z "$message" ]]; then
+                    message="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Auto-stage if requested or if nothing is staged
+    local staged_count
+    staged_count=$(git diff --cached --name-only 2>/dev/null | wc -l)
+    if [[ "$staged_count" -eq 0 ]] || [[ "$auto_stage" == true ]]; then
+        print_step "Auto-staging all changes..."
+        git add -A
+        staged_count=$(git diff --cached --name-only 2>/dev/null | wc -l)
+    fi
+
+    if [[ "$staged_count" -eq 0 ]]; then
+        print_warn "Nothing to commit. Working tree is clean."
+        return 0
+    fi
+
+    # If no message provided, generate one
+    if [[ -z "$message" ]]; then
+        print_step "No commit message provided — generating one..."
+        message=$(generate_commit_message)
+        print_info "Generated message: ${BOLD}\"$message\"${NC}"
+        echo
+        read -rp "$(echo -e ${BLUE}${INFO}${NC}  Use this message? [Y/n/edit] ")" choice
+        choice=${choice:-Y}
+        case "${choice,,}" in
+            y|yes)
+                ;;
+            e|edit)
+                read -rp "Enter your commit message: " message
+                ;;
+            *)
+                read -rp "Enter your commit message: " message
+                ;;
+        esac
+    fi
+
+    print_header "Committing"
+    if git commit -m "$message"; then
+        print_success "Committed successfully!"
+        print_dim "  $(git log -1 --oneline)"
+    else
+        print_error "Commit failed."
+        exit 1
+    fi
+}
+
+# Generate a simple commit message from the diff
+generate_commit_message() {
+    local msg=""
+    local staged
+    staged=$(git diff --cached --name-only 2>/dev/null)
+
+    local added=0 modified=0 deleted=0
+    while IFS= read -r f; do
+        local status
+        status=$(git diff --cached --name-status -- "$f" 2>/dev/null | head -1 | cut -c1)
+        case "$status" in
+            A) ((added++)) ;;
+            M) ((modified++)) ;;
+            D) ((deleted++)) ;;
+            *) ((modified++)) ;;
+        esac
+    done <<< "$staged"
+
+    local parts=()
+    [[ $added -gt 0 ]]    && parts+=("add $added file(s)")
+    [[ $modified -gt 0 ]] && parts+=("update $modified file(s)")
+    [[ $deleted -gt 0 ]]  && parts+=("remove $deleted file(s)")
+
+    local action="update"
+    if [[ $added -gt 0 ]] && [[ $modified -eq 0 ]] && [[ $deleted -eq 0 ]]; then
+        action="add"
+    elif [[ $deleted -gt 0 ]] && [[ $added -eq 0 ]] && [[ $modified -eq 0 ]]; then
+        action="remove"
+    fi
+
+    # Try to guess scope from most common directory
+    local scope=""
+    scope=$(echo "$staged" | sed 's|/.*||' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    if [[ -n "$scope" ]] && [[ "$scope" != "$(echo "$staged" | head -1)" ]]; then
+        scope="($scope)"
+    else
+        scope=""
+    fi
+
+    echo "${action}${scope}: $(IFS=', '; echo "${parts[*]}")"
+}
+
+# ─── Command: push ──────────────────────────────────────────────────────────
+cmd_push() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local force=false
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force)
+                force=true
+                shift
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    # Check for unpushed commits
+    local upstream
+    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+
+    if [[ -z "$upstream" ]]; then
+        local branch
+        branch=$(current_branch)
+        print_header "Setting up remote tracking"
+        print_step "No upstream found for '${branch}'. Pushing and setting upstream to 'origin/${branch}'..."
+        if git push -u origin "$branch" "${args[@]}"; then
+            print_success "Pushed and tracking 'origin/${branch}'."
+        else
+            print_error "Push failed."
+            exit 1
+        fi
+        return
+    fi
+
+    local ahead
+    ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+    if [[ "$ahead" -eq 0 ]] && [[ "$force" == false ]]; then
+        print_warn "Nothing to push. You're up to date."
+        return 0
+    fi
+
+    print_header "Pushing to ${upstream}"
+    if [[ "$force" == true ]]; then
+        print_warn "Force push enabled."
+        git push --force-with-lease "${args[@]}"
+    else
+        git push "${args[@]}"
+    fi
+
+    if [[ $? -eq 0 ]]; then
+        print_success "Pushed ${ahead} commit(s) successfully!"
+    else
+        print_error "Push failed."
+        exit 1
+    fi
+}
+
+# ─── Command: pull ──────────────────────────────────────────────────────────
+cmd_pull() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local upstream
+    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+
+    if [[ -z "$upstream" ]]; then
+        print_error "No upstream branch is configured for '$(current_branch)'."
+        print_info  "Try pushing first:  bgit push"
+        exit 1
+    fi
+
+    print_header "Pulling from ${upstream}"
+
+    # Check for local changes first
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        print_warn "You have uncommitted changes. Stashing them temporarily..."
+        git stash push -m "bgit-auto-stash-$(date +%s)" >/dev/null 2>&1
+        local stashed=true
+    fi
+
+    if git pull --no-rebase; then
+        print_success "Pull completed successfully!"
+    else
+        print_warn "Pull resulted in conflicts."
+        if has_conflicts; then
+            print_info "Attempting auto-resolve..."
+            cmd_resolve --auto
+        else
+            print_error "Pull failed."
+            if [[ "${stashed:-false}" == true ]]; then
+                print_step "Restoring your stashed changes..."
+                git stash pop >/dev/null 2>&1
+            fi
+            exit 1
+        fi
+    fi
+
+    # Restore stash if we stashed
+    if [[ "${stashed:-false}" == true ]]; then
+        print_step "Restoring your stashed changes..."
+        if git stash pop; then
+            print_success "Changes restored."
+        else
+            print_warn "Could not auto-restore stash. Run ${BOLD}git stash pop${NC} manually."
+        fi
+    fi
+}
+
+# ─── Command: merge ─────────────────────────────────────────────────────────
+cmd_merge() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        print_error "Please specify a branch to merge."
+        print_info  "Usage: bgit merge <branch>"
+        exit 1
+    fi
+
+    local target="$1"
+    shift
+    local strategy=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ours|--theirs|--union)
+                strategy="$1"
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    print_header "Merging '${target}' into '$(current_branch)'"
+
+    # Make sure working tree is clean
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        print_warn "Working tree is not clean. Stashing changes..."
+        git stash push -m "bgit-merge-stash-$(date +%s)" >/dev/null 2>&1
+        local stashed=true
+    fi
+
+    if git merge "$target" 2>&1; then
+        print_success "Merge completed cleanly!"
+    else
+        print_warn "Merge produced conflicts."
+        if [[ -n "$strategy" ]]; then
+            print_info "Auto-resolving with strategy: ${strategy}"
+            resolve_with_strategy "$strategy"
+            if git commit --no-edit 2>/dev/null; then
+                print_success "Conflicts resolved and merge committed!"
+            else
+                print_warn "Conflicts resolved but commit needs your attention."
+                print_info  "Run: bgit commit"
+            fi
+        else
+            print_info  "Run ${BOLD}bgit resolve${NC} to auto-resolve, or"
+            print_info  "  bgit resolve --ours   (keep your changes)"
+            print_info  "  bgit resolve --theirs (keep incoming changes)"
+        fi
+    fi
+
+    if [[ "${stashed:-false}" == true ]]; then
+        print_step "Restoring stashed changes..."
+        git stash pop 2>/dev/null && print_success "Changes restored." || true
+    fi
+}
+
+# ─── Command: resolve ───────────────────────────────────────────────────────
+# Auto-resolve merge conflicts
+resolve_with_strategy() {
+    local strategy="$1"
+    local files
+    files=$(conflicted_files)
+
+    if [[ -z "$files" ]]; then
+        return 0
+    fi
+
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        case "$strategy" in
+            --ours)
+                git checkout --ours "$file" 2>/dev/null
+                print_step "Resolved (ours):   $file"
+                ;;
+            --theirs)
+                git checkout --theirs "$file" 2>/dev/null
+                print_step "Resolved (theirs): $file"
+                ;;
+            --union)
+                # Remove conflict markers, keep both sets of changes
+                if [[ -f "$file" ]]; then
+                    # Use git's merge-file with --union
+                    git merge-file --union -p "$file" "$file" "$file" 2>/dev/null > "${file}.resolved" || true
+                    if [[ -f "${file}.resolved" ]]; then
+                        mv "${file}.resolved" "$file"
+                    fi
+                fi
+                print_step "Resolved (union):  $file"
+                ;;
+        esac
+        git add "$file" 2>/dev/null
+    done <<< "$files"
+}
+
+cmd_resolve() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local strategy=""
+    local auto=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ours)
+                strategy="--ours"
+                shift
+                ;;
+            --theirs)
+                strategy="--theirs"
+                shift
+                ;;
+            --union)
+                strategy="--union"
+                shift
+                ;;
+            --auto)
+                auto=true
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    print_header "Resolving Merge Conflicts"
+
+    if ! has_conflicts; then
+        print_success "No conflicts detected. You're all clean!"
+        return 0
+    fi
+
+    local files
+    files=$(conflicted_files)
+    local count
+    count=$(echo "$files" | wc -l)
+
+    echo -e "  ${RED}${CONFLICT_ICON}${NC} Found ${BOLD}${count}${NC} conflicted file(s):"
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && echo -e "    ${RED}!${NC} $f"
+    done <<< "$files"
+    echo
+
+    # If no strategy and not auto, ask interactively
+    if [[ -z "$strategy" ]] && [[ "$auto" == false ]]; then
+        echo -e "  ${BOLD}Choose a resolution strategy:${NC}"
+        echo -e "    ${CYAN}1${NC}) Keep MY changes        (--ours)"
+        echo -e "    ${CYAN}2${NC}) Keep INCOMING changes   (--theirs)"
+        echo -e "    ${CYAN}3${NC}) Combine both            (--union)"
+        echo -e "    ${CYAN}4${NC}) Decide per file"
+        echo -e "    ${CYAN}5${NC}) Cancel"
+        echo
+        read -rp "$(echo -e ${BLUE}${INFO}${NC}  Select [1-5]: )" choice
+
+        case "$choice" in
+            1) strategy="--ours" ;;
+            2) strategy="--theirs" ;;
+            3) strategy="--union" ;;
+            4)
+                # Per-file resolution
+                while IFS= read -r f; do
+                    [[ -z "$f" ]] && continue
+                    echo
+                    print_info "File: $f"
+                    echo -e "    ${CYAN}1${NC}) Keep mine"
+                    echo -e "    ${CYAN}2${NC}) Keep incoming"
+                    echo -e "    ${CYAN}3${NC}) Combine"
+                    echo -e "    ${CYAN}4${NC}) Skip (leave conflicted)"
+                    read -rp "  Choice [1-4]: " fchoice
+                    case "$fchoice" in
+                        1) git checkout --ours "$f" 2>/dev/null; git add "$f"; print_step "Resolved (ours): $f" ;;
+                        2) git checkout --theirs "$f" 2>/dev/null; git add "$f"; print_step "Resolved (theirs): $f" ;;
+                        3)
+                            if [[ -f "$f" ]]; then
+                                git merge-file --union -p "$f" "$f" "$f" 2>/dev/null > "${f}.resolved" || true
+                                [[ -f "${f}.resolved" ]] && mv "${f}.resolved" "$f"
+                            fi
+                            git add "$f"
+                            print_step "Resolved (union): $f"
+                            ;;
+                        4) print_warn "Skipped: $f" ;;
+                    esac
+                done <<< "$files"
+                # After per-file, check if all resolved
+                if has_conflicts; then
+                    print_warn "Some files are still conflicted."
+                    return 0
+                fi
+                print_success "All conflicts resolved!"
+                print_info "Run ${BOLD}bgit commit${NC} to finalize."
+                return 0
+                ;;
+            *)
+                print_warn "Cancelled."
+                return 0
+                ;;
+        esac
+    fi
+
+    # If auto with no strategy, try smart resolution
+    if [[ "$auto" == true ]] && [[ -z "$strategy" ]]; then
+        strategy="--ours"
+        print_step "Auto-mode: defaulting to keep your changes (--ours)."
+    fi
+
+    if [[ -n "$strategy" ]]; then
+        resolve_with_strategy "$strategy"
+    fi
+
+    if has_conflicts; then
+        print_warn "Some files could not be auto-resolved."
+        print_info  "You may need to resolve them manually."
+    else
+        print_success "All conflicts resolved!"
+        echo
+        print_info "Finalize the merge with:  bgit commit"
+    fi
+}
+
+# ─── Command: clone ─────────────────────────────────────────────────────────
+cmd_clone() {
+    require_git
+    if [[ $# -eq 0 ]]; then
+        print_error "Please provide a repository URL."
+        print_info  "Usage: bgit clone <url> [directory]"
+        exit 1
+    fi
+
+    local url="$1"
+    shift
+    local dir="${1:-}"
+
+    print_header "Cloning Repository"
+    print_step "URL: $url"
+    [[ -n "$dir" ]] && print_step "Target: $dir"
+
+    if [[ -n "$dir" ]]; then
+        if git clone "$url" "$dir"; then
+            print_success "Cloned into '${dir}'!"
+            cd "$dir" || return
+            print_info "Now in $(pwd)"
+        fi
+    else
+        if git clone "$url"; then
+            local repo_name
+            repo_name=$(basename "$url" .git)
+            print_success "Cloned into '${repo_name}'!"
+        fi
+    fi
+}
+
+# ─── Command: branch ────────────────────────────────────────────────────────
+cmd_branch() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        print_header "Branches"
+        local current
+        current=$(current_branch)
+        git branch | while IFS= read -r line; do
+            line="${line//\*/ }"
+            line="$(echo "$line" | xargs)"
+            if [[ "$line" == "$current" ]]; then
+                echo -e "  ${GREEN}${BRANCH_ICON} * ${BOLD}${line}${NC}"
+            else
+                echo -e "  ${GRAY}   ${line}${NC}"
+            fi
+        done
+        return
+    fi
+
+    local action="$1"
+    case "$action" in
+        new|create)
+            local name="$2"
+            print_header "Creating branch '${name}'"
+            git checkout -b "$name"
+            print_success "On branch '${name}'"
+            ;;
+        delete|rm)
+            local name="$2"
+            print_header "Deleting branch '${name}'"
+            git branch -d "$name"
+            print_success "Deleted branch '${name}'"
+            ;;
+        switch|checkout)
+            local name="$2"
+            print_header "Switching to branch '${name}'"
+            git checkout "$name"
+            print_success "Now on branch '${name}'"
+            ;;
+        *)
+            print_error "Unknown branch action: $action"
+            print_info  "Usage: bgit branch [new|delete|switch] [name]"
+            ;;
+    esac
+}
+
+# ─── Command: log ───────────────────────────────────────────────────────────
+cmd_log() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local count="${1:-15}"
+    print_header "Recent Commits"
+    git log --oneline --graph --decorate -n "$count" | while IFS= read -r line; do
+        echo -e "  ${CYAN}${line}${NC}"
+    done
+}
+
+# ─── Command: stash ─────────────────────────────────────────────────────────
+cmd_stash() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local action="${1:-list}"
+
+    case "$action" in
+        save|push|"")
+            print_header "Stashing changes"
+            git stash push -m "bgit-stash-$(date +%Y%m%d-%H%M%S)"
+            print_success "Changes stashed."
+            ;;
+        pop)
+            print_header "Popping stash"
+            git stash pop
+            print_success "Stash applied."
+            ;;
+        list)
+            print_header "Stash list"
+            local stashes
+            stashes=$(git stash list)
+            if [[ -z "$stashes" ]]; then
+                print_info "No stashes found."
+            else
+                echo "$stashes"
+            fi
+            ;;
+        drop)
+            git stash drop "${2:-0}"
+            print_success "Stash dropped."
+            ;;
+    esac
+}
+
+# ─── Command: sync ──────────────────────────────────────────────────────────
+# Pull + merge + push in one friendly step
+cmd_sync() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    print_header "Syncing with Remote"
+    print_step "Pulling latest changes..."
+    cmd_pull
+    echo
+    print_step "Pushing local changes..."
+    cmd_push
+    print_success "Sync complete!"
+}
+
+# ─── Command: undo ──────────────────────────────────────────────────────────
+cmd_undo() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    local type="${1:-last}"
+
+    case "$type" in
+        last|commit)
+            print_header "Undoing last commit (keeping changes)"
+            git reset --soft HEAD~1
+            print_success "Last commit undone. Your changes are staged."
+            ;;
+        hard)
+            print_warn "This will DISCARD all uncommitted changes!"
+            read -rp "Are you sure? [y/N] " confirm
+            if [[ "${confirm,,}" == "y" ]]; then
+                git reset --hard HEAD
+                git clean -fd
+                print_success "Working tree reset to HEAD."
+            else
+                print_info "Cancelled."
+            fi
+            ;;
+        add)
+            print_header "Unstaging all files"
+            git reset HEAD .
+            print_success "Files unstaged."
+            ;;
+        *)
+            print_error "Unknown undo type: $type"
+            print_info  "Usage: bgit undo [last|hard|add]"
+            ;;
+    esac
+}
+
+# ─── Command: config ────────────────────────────────────────────────────────
+cmd_config() {
+    require_git
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        exit 1
+    fi
+
+    print_header "Git Configuration"
+    local name email
+    name=$(git config user.name 2>/dev/null || echo "(not set)")
+    email=$(git config user.email 2>/dev/null || echo "(not set)")
+
+    echo -e "  ${BOLD}user.name:${NC}  $name"
+    echo -e "  ${BOLD}user.email:${NC} $email"
+    echo -e "  ${BOLD}branch:${NC}     $(current_branch)"
+    echo -e "  ${BOLD}remote:${NC}     $(git remote -v 2>/dev/null | head -1 || echo '(none)')"
+}
+
+# ─── Command: version ───────────────────────────────────────────────────────
+cmd_version() {
+    echo -e "${BOLD}${PURPLE}BGit${NC} version ${GREEN}${VERSION}${NC}"
+    echo -e "${DIM}Better Git — a friendlier git wrapper${NC}"
+    echo -e "${DIM}https://github.com/connorgentile113-png/BGit${NC}"
+}
+
+# ─── Command: help ──────────────────────────────────────────────────────────
+cmd_help() {
+    echo -e "${BOLD}${PURPLE}"
+    echo "  ╔══════════════════════════════════════╗"
+    echo "  ║          BGit — Better Git           ║"
+    echo "  ╚══════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo -e "  ${BOLD}A cleaner, friendlier wrapper around git.${NC}"
+    echo
+    echo -e "  ${BOLD}${CYAN}USAGE${NC}"
+    echo -e "    bgit <command> [options]"
+    echo
+    echo -e "  ${BOLD}${CYAN}COMMANDS${NC}"
+    echo
+    echo -e "    ${BOLD}init${NC}              Initialize a new Git repository"
+    echo -e "    ${BOLD}status${NC}            Show a clean summary of repo state"
+    echo -e "    ${BOLD}add${NC} [file|.]      Stage files (default: all)"
+    echo -e "    ${BOLD}commit${NC} [-m msg]   Commit staged changes (auto-generates message)"
+    echo -e "    ${BOLD}push${NC} [-f]         Push to remote (auto-sets upstream)"
+    echo -e "    ${BOLD}pull${NC}              Pull from remote (auto-stashes, auto-resolves)"
+    echo -e "    ${BOLD}merge${NC} <branch>    Merge a branch (auto-resolves conflicts)"
+    echo -e "    ${BOLD}resolve${NC} [strategy] Auto-resolve merge conflicts"
+    echo -e "    ${BOLD}clone${NC} <url>       Clone a repository"
+    echo -e "    ${BOLD}branch${NC} [action]   List/create/delete/switch branches"
+    echo -e "    ${BOLD}log${NC} [n]           Show recent commits (default: 15)"
+    echo -e "    ${BOLD}stash${NC} [action]    Save/pop/list stashed changes"
+    echo -e "    ${BOLD}sync${NC}              Pull + push in one step"
+    echo -e "    ${BOLD}undo${NC} [type]       Undo last commit / hard reset / unstage"
+    echo -e "    ${BOLD}config${NC}            Show git configuration"
+    echo -e "    ${BOLD}version${NC}           Show BGit version"
+    echo -e "    ${BOLD}help${NC}              Show this help message"
+    echo
+    echo -e "  ${BOLD}${CYAN}CONFLICT RESOLUTION STRATEGIES${NC}"
+    echo -e "    ${BOLD}--ours${NC}           Keep your local changes"
+    echo -e "    ${BOLD}--theirs${NC}         Keep incoming/remote changes"
+    echo -e "    ${BOLD}--union${NC}          Combine both sides"
+    echo -e "    ${BOLD}--auto${NC}           Auto-resolve (defaults to --ours)"
+    echo
+    echo -e "  ${BOLD}${CYAN}EXAMPLES${NC}"
+    echo -e "    ${DIM}# Start a new project${NC}"
+    echo -e "    bgit init && bgit add . && bgit commit -m \"Initial commit\""
+    echo
+    echo -e "    ${DIM}# Resolve conflicts keeping your changes${NC}"
+    echo -e "    bgit resolve --ours"
+    echo
+    echo -e "    ${DIM}# Full sync with remote${NC}"
+    echo -e "    bgit sync"
+    echo
+    echo -e "  ${BOLD}${CYAN}PASS-THROUGH${NC}"
+    echo -e "    Any unrecognized command is passed directly to ${BOLD}git${NC}."
+    echo -e "    ${DIM}bgit rebase -i HEAD~3${NC}  →  ${DIM}git rebase -i HEAD~3${NC}"
+    echo
+}
+
+# ─── Main Entry Point ───────────────────────────────────────────────────────
+main() {
+    if [[ $# -eq 0 ]]; then
+        cmd_help
+        exit 0
+    fi
+
+    local command="$1"
+    shift
+
+    case "$command" in
+        init)       cmd_init "$@" ;;
+        status|st)  cmd_status "$@" ;;
+        add)        cmd_add "$@" ;;
+        commit|ci)  cmd_commit "$@" ;;
+        push)       cmd_push "$@" ;;
+        pull)       cmd_pull "$@" ;;
+        merge)      cmd_merge "$@" ;;
+        resolve)    cmd_resolve "$@" ;;
+        clone)      cmd_clone "$@" ;;
+        branch|br)  cmd_branch "$@" ;;
+        log)        cmd_log "$@" ;;
+        stash)      cmd_stash "$@" ;;
+        sync)       cmd_sync "$@" ;;
+        undo)       cmd_undo "$@" ;;
+        config)     cmd_config "$@" ;;
+        version|-v|--version) cmd_version "$@" ;;
+        help|-h|--help) cmd_help "$@" ;;
+        *)
+            # Pass-through to git for any unrecognized command
+            require_git
+            git "$command" "$@"
+            ;;
+    esac
+}
+
+main "$@"
