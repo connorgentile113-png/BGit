@@ -10,7 +10,7 @@
 
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ─── Colors ─────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -117,7 +117,6 @@ cmd_status() {
     branch=$(current_branch)
     echo -e "  ${BRANCH_ICON} Branch: ${BOLD}${branch}${NC}"
 
-    # Upstream tracking
     local upstream
     upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
     if [[ -n "$upstream" ]]; then
@@ -224,6 +223,7 @@ cmd_commit() {
 
     local message=""
     local auto_stage=false
+    local choice=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -264,7 +264,7 @@ cmd_commit() {
         message=$(generate_commit_message)
         print_info "Generated message: ${BOLD}\"$message\"${NC}"
         echo
-        read -rp "$(echo -e ${BLUE}${INFO}${NC}  Use this message? [Y/n/edit] ")" choice
+        read -rp "$(echo -e "${BLUE}${INFO}${NC}  Use this message? [Y/n/edit] ")" choice
         choice=${choice:-Y}
         case "${choice,,}" in
             y|yes)
@@ -290,19 +290,20 @@ cmd_commit() {
 
 # Generate a simple commit message from the diff
 generate_commit_message() {
-    local msg=""
     local staged
     staged=$(git diff --cached --name-only 2>/dev/null)
 
-    local added=0 modified=0 deleted=0
+    local added=0
+    local modified=0
+    local deleted=0
     while IFS= read -r f; do
         local status
         status=$(git diff --cached --name-status -- "$f" 2>/dev/null | head -1 | cut -c1)
         case "$status" in
-            A) ((added++)) ;;
-            M) ((modified++)) ;;
-            D) ((deleted++)) ;;
-            *) ((modified++)) ;;
+            A) added=$((added + 1)) ;;
+            M) modified=$((modified + 1)) ;;
+            D) deleted=$((deleted + 1)) ;;
+            *) modified=$((modified + 1)) ;;
         esac
     done <<< "$staged"
 
@@ -414,10 +415,11 @@ cmd_pull() {
     print_header "Pulling from ${upstream}"
 
     # Check for local changes first
+    local stashed=false
     if ! git diff --quiet || ! git diff --cached --quiet; then
         print_warn "You have uncommitted changes. Stashing them temporarily..."
         git stash push -m "bgit-auto-stash-$(date +%s)" >/dev/null 2>&1
-        local stashed=true
+        stashed=true
     fi
 
     if git pull --no-rebase; then
@@ -429,7 +431,7 @@ cmd_pull() {
             cmd_resolve --auto
         else
             print_error "Pull failed."
-            if [[ "${stashed:-false}" == true ]]; then
+            if [[ "$stashed" == true ]]; then
                 print_step "Restoring your stashed changes..."
                 git stash pop >/dev/null 2>&1
             fi
@@ -438,7 +440,7 @@ cmd_pull() {
     fi
 
     # Restore stash if we stashed
-    if [[ "${stashed:-false}" == true ]]; then
+    if [[ "$stashed" == true ]]; then
         print_step "Restoring your stashed changes..."
         if git stash pop; then
             print_success "Changes restored."
@@ -481,10 +483,11 @@ cmd_merge() {
     print_header "Merging '${target}' into '$(current_branch)'"
 
     # Make sure working tree is clean
+    local stashed=false
     if ! git diff --quiet || ! git diff --cached --quiet; then
         print_warn "Working tree is not clean. Stashing changes..."
         git stash push -m "bgit-merge-stash-$(date +%s)" >/dev/null 2>&1
-        local stashed=true
+        stashed=true
     fi
 
     if git merge "$target" 2>&1; then
@@ -507,7 +510,7 @@ cmd_merge() {
         fi
     fi
 
-    if [[ "${stashed:-false}" == true ]]; then
+    if [[ "$stashed" == true ]]; then
         print_step "Restoring stashed changes..."
         git stash pop 2>/dev/null && print_success "Changes restored." || true
     fi
@@ -536,9 +539,7 @@ resolve_with_strategy() {
                 print_step "Resolved (theirs): $file"
                 ;;
             --union)
-                # Remove conflict markers, keep both sets of changes
                 if [[ -f "$file" ]]; then
-                    # Use git's merge-file with --union
                     git merge-file --union -p "$file" "$file" "$file" 2>/dev/null > "${file}.resolved" || true
                     if [[ -f "${file}.resolved" ]]; then
                         mv "${file}.resolved" "$file"
@@ -603,6 +604,9 @@ cmd_resolve() {
     done <<< "$files"
     echo
 
+    local choice=""
+    local fchoice=""
+
     # If no strategy and not auto, ask interactively
     if [[ -z "$strategy" ]] && [[ "$auto" == false ]]; then
         echo -e "  ${BOLD}Choose a resolution strategy:${NC}"
@@ -612,14 +616,13 @@ cmd_resolve() {
         echo -e "    ${CYAN}4${NC}) Decide per file"
         echo -e "    ${CYAN}5${NC}) Cancel"
         echo
-        read -rp "$(echo -e ${BLUE}${INFO}${NC}  Select [1-5]: )" choice
+        read -rp "$(echo -e "${BLUE}${INFO}${NC}  Select [1-5]: ")" choice
 
         case "$choice" in
             1) strategy="--ours" ;;
             2) strategy="--theirs" ;;
             3) strategy="--union" ;;
             4)
-                # Per-file resolution
                 while IFS= read -r f; do
                     [[ -z "$f" ]] && continue
                     echo
@@ -643,7 +646,6 @@ cmd_resolve() {
                         4) print_warn "Skipped: $f" ;;
                     esac
                 done <<< "$files"
-                # After per-file, check if all resolved
                 if has_conflicts; then
                     print_warn "Some files are still conflicted."
                     return 0
@@ -736,21 +738,32 @@ cmd_branch() {
     fi
 
     local action="$1"
+    local name="${2:-}"
+
     case "$action" in
         new|create)
-            local name="$2"
+            if [[ -z "$name" ]]; then
+                print_error "Please provide a branch name."
+                return 1
+            fi
             print_header "Creating branch '${name}'"
             git checkout -b "$name"
             print_success "On branch '${name}'"
             ;;
         delete|rm)
-            local name="$2"
+            if [[ -z "$name" ]]; then
+                print_error "Please provide a branch name."
+                return 1
+            fi
             print_header "Deleting branch '${name}'"
             git branch -d "$name"
             print_success "Deleted branch '${name}'"
             ;;
         switch|checkout)
-            local name="$2"
+            if [[ -z "$name" ]]; then
+                print_error "Please provide a branch name."
+                return 1
+            fi
             print_header "Switching to branch '${name}'"
             git checkout "$name"
             print_success "Now on branch '${name}'"
@@ -816,7 +829,6 @@ cmd_stash() {
 }
 
 # ─── Command: sync ──────────────────────────────────────────────────────────
-# Pull + merge + push in one friendly step
 cmd_sync() {
     require_git
     if ! in_git_repo; then
@@ -842,6 +854,7 @@ cmd_undo() {
     fi
 
     local type="${1:-last}"
+    local confirm=""
 
     case "$type" in
         last|commit)
@@ -981,7 +994,6 @@ main() {
         version|-v|--version) cmd_version "$@" ;;
         help|-h|--help) cmd_help "$@" ;;
         *)
-            # Pass-through to git for any unrecognized command
             require_git
             git "$command" "$@"
             ;;
