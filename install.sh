@@ -22,6 +22,7 @@ RAW_SCRIPT="$REPO_URL/bgit"
 print_info()    { echo -e "${BLUE}ℹ️${NC}  $1"; }
 print_success() { echo -e "${GREEN}✅${NC} $1"; }
 print_error()   { echo -e "${RED}❌${NC} $1" >&2; }
+print_warn()    { echo -e "${YELLOW}⚠️${NC}  $1"; }
 print_step()    { echo -e "  ${CYAN}→${NC} $1"; }
 print_header()  { echo -e "\n${BOLD}${PURPLE}🚀 $1${NC}\n"; }
 
@@ -119,6 +120,9 @@ else
         exit 1
     fi
 fi
+
+# CRITICAL FIX: Remove Windows CRLF line endings if present
+sed -i 's/\r$//' "$TMP_FILE"
 
 # Verify the downloaded file looks like a bash script
 if ! head -1 "$TMP_FILE" | grep -q "bash"; then
