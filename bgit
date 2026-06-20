@@ -10,7 +10,8 @@
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
+UPDATE_URL="https://raw.githubusercontent.com/connorgentile113-png/BGit/main/bgit"
 
 # ─── Colors (respect NO_COLOR and non-tty output) ──────────────────────────
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
@@ -40,6 +41,7 @@ PUSH_ICON="⬆️"
 PULL_ICON="⬇️"
 TAG_ICON="🏷️"
 CLEAN_ICON="🧹"
+UPDATE_ICON="🔄"
 
 # ─── Print Helpers ──────────────────────────────────────────────────────────
 print_info()    { echo -e "${BLUE}${INFO}${NC}  $1"; }
@@ -104,7 +106,8 @@ ahead_behind() {
 cmd_init() {
     print_header "Initializing a new Git repository"
     if in_git_repo; then
-        print_warn "This directory is already a Git repository."
+        print_warn "This directory is already a Git repository — nothing to do."
+        print_dim "  Run ${BOLD}bgit status${NC} to see what's going on in here."
         return 0
     fi
     git init
@@ -114,9 +117,9 @@ cmd_init() {
     git config pull.rebase false 2>/dev/null || true
     print_success "Defaults configured."
     echo
-    print_info "Next steps:"
-    print_dim "  bgit add .         — stage your files"
-    print_dim "  bgit commit -m \"Initial commit\""
+    echo -e "  ${BOLD}${GREEN}You're all set!${NC} Here's where to go next:"
+    print_dim "  bgit add .                      — stage your files"
+    print_dim "  bgit commit -m \"Initial commit\"  — save your first snapshot"
     echo
 }
 
@@ -203,7 +206,7 @@ cmd_status() {
     fi
 
     if [[ -z "$staged" ]] && [[ -z "$modified" ]] && [[ -z "$untracked" ]]; then
-        print_success "Working tree is clean. Nothing to do. 🎉"
+        print_success "Nothing to see here — working tree is clean. 🎉"
     fi
 }
 
@@ -291,7 +294,7 @@ cmd_commit() {
     fi
 
     if [[ "$staged_count" -eq 0 ]]; then
-        print_warn "Nothing to commit. Working tree is clean."
+        print_info "Nothing staged to commit — working tree is clean."
         return 0
     fi
 
@@ -437,7 +440,7 @@ cmd_push() {
     local ahead
     ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
     if [[ "$ahead" -eq 0 ]] && [[ "$force" == false ]]; then
-        print_warn "Nothing to push. You're up to date."
+        print_info "Already up to date — nothing to push."
         return 0
     fi
 
@@ -1047,11 +1050,164 @@ cmd_config() {
     echo -e "  ${BOLD}remote:${NC}     $(git remote -v 2>/dev/null | head -1 || echo '(none)')"
 }
 
+# Compares two dotted version strings. Echoes: gt | lt | eq
+version_compare() {
+    local v1="$1" v2="$2"
+    if [[ "$v1" == "$v2" ]]; then
+        echo "eq"
+        return
+    fi
+    local IFS=.
+    local -a a=($v1) b=($v2)
+    local i
+    for ((i=0; i<3; i++)); do
+        local x="${a[i]:-0}" y="${b[i]:-0}"
+        # strip any non-numeric suffix just in case
+        x="${x//[^0-9]/}"; y="${y//[^0-9]/}"
+        x="${x:-0}"; y="${y:-0}"
+        if ((10#$x > 10#$y)); then echo "gt"; return; fi
+        if ((10#$x < 10#$y)); then echo "lt"; return; fi
+    done
+    echo "eq"
+}
+
+# ─── Command: update ────────────────────────────────────────────────────────
+cmd_update() {
+    local check_only=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check) check_only=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    print_header "Checking for updates"
+
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        print_error "Need curl or wget to check for updates, and neither is installed."
+        exit 1
+    fi
+
+    # Find where the running script actually lives, not a guessed path
+    local self_path
+    self_path=$(command -v bgit 2>/dev/null || echo "")
+    if [[ -z "$self_path" ]]; then
+        self_path="${BASH_SOURCE[0]}"
+    fi
+    # Resolve symlinks so we update the real file
+    if command -v readlink &>/dev/null; then
+        self_path=$(readlink -f "$self_path" 2>/dev/null || echo "$self_path")
+    fi
+
+    if [[ ! -f "$self_path" ]]; then
+        print_error "Couldn't figure out where bgit is installed."
+        print_info  "Try re-running the installer instead."
+        exit 1
+    fi
+
+    print_step "Currently installed: ${BOLD}v${VERSION}${NC} (${self_path})"
+    print_step "Downloading the latest version..."
+
+    local tmp_file
+    tmp_file=$(mktemp)
+
+    if command -v curl &>/dev/null; then
+        if ! curl -fsSL "$UPDATE_URL" -o "$tmp_file" 2>/dev/null; then
+            print_error "Couldn't reach GitHub to check for updates."
+            print_info  "Check your internet connection, or try again in a bit."
+            rm -f "$tmp_file"
+            exit 1
+        fi
+    else
+        if ! wget -qO "$tmp_file" "$UPDATE_URL" 2>/dev/null; then
+            print_error "Couldn't reach GitHub to check for updates."
+            rm -f "$tmp_file"
+            exit 1
+        fi
+    fi
+
+    # Strip Windows line endings, same fix as the installer
+    sed -i.bak 's/\r$//' "$tmp_file" 2>/dev/null && rm -f "${tmp_file}.bak"
+
+    # Sanity check: does this even look like bgit?
+    if ! head -5 "$tmp_file" | grep -q "BGit" ; then
+        print_error "The downloaded file doesn't look like a valid BGit script."
+        print_info  "Skipping update to be safe — nothing was changed."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    if ! bash -n "$tmp_file" 2>/dev/null; then
+        print_error "The downloaded version has a syntax error."
+        print_info  "Skipping update to be safe — nothing was changed."
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    local remote_version
+    remote_version=$(grep -m1 '^VERSION=' "$tmp_file" | sed -E 's/VERSION="([^"]*)"/\1/')
+    remote_version="${remote_version:-unknown}"
+
+    local cmp
+    cmp=$(version_compare "$remote_version" "$VERSION")
+
+    if [[ "$cmp" == "eq" ]]; then
+        print_success "You're already on the latest version (v${VERSION})."
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    if [[ "$cmp" == "lt" ]]; then
+        print_success "You're running v${VERSION}, which is newer than what's published (v${remote_version})."
+        print_dim "  Nothing to do — you're ahead of the curve."
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    echo
+    print_info "New version available: ${BOLD}v${VERSION}${NC} → ${BOLD}${GREEN}v${remote_version}${NC}"
+
+    if [[ "$check_only" == true ]]; then
+        print_info "Run ${BOLD}bgit update${NC} (without --check) to install it."
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    # Back up the current version before touching anything
+    local backup_path="${self_path}.bak"
+    cp "$self_path" "$backup_path" 2>/dev/null || {
+        print_error "Couldn't create a backup at ${backup_path} — aborting to be safe."
+        rm -f "$tmp_file"
+        exit 1
+    }
+    print_step "Backed up current version to ${DIM}${backup_path}${NC}"
+
+    chmod +x "$tmp_file"
+
+    if [[ -w "$self_path" ]]; then
+        mv "$tmp_file" "$self_path"
+    else
+        print_step "Need elevated permissions to write to ${self_path}..."
+        sudo mv "$tmp_file" "$self_path" 2>/dev/null || {
+            print_error "Couldn't write to ${self_path}, even with sudo."
+            print_info  "Your old version is safe and untouched."
+            rm -f "$tmp_file"
+            exit 1
+        }
+        sudo chmod +x "$self_path" 2>/dev/null || true
+    fi
+
+    print_success "Updated to ${BOLD}v${remote_version}${NC}! 🎉"
+    print_dim "  Old version backed up at ${backup_path} (delete it anytime)"
+    print_dim "  Run 'bgit version' to confirm."
+}
+
 # ─── Command: version ───────────────────────────────────────────────────────
 cmd_version() {
     echo -e "${BOLD}${PURPLE}BGit${NC} version ${GREEN}${VERSION}${NC}"
     echo -e "${DIM}Better Git — a friendlier git wrapper${NC}"
     echo -e "${DIM}https://github.com/connorgentile113-png/BGit${NC}"
+    echo -e "${DIM}Run 'bgit update' to check for the latest version.${NC}"
 }
 
 # ─── Command: help ──────────────────────────────────────────────────────────
@@ -1094,6 +1250,7 @@ cmd_help() {
     echo -e "    ${BOLD}clone${NC} <url>       Clone a repository"
     echo -e "    ${BOLD}whoami${NC}            Quick identity + branch + remote summary"
     echo -e "    ${BOLD}config${NC}            Show git configuration"
+    echo -e "    ${BOLD}update${NC} [--check]  Update bgit to the latest version"
     echo -e "    ${BOLD}version${NC}           Show BGit version"
     echo -e "    ${BOLD}help${NC}              Show this help message"
     echo
@@ -1115,6 +1272,10 @@ cmd_help() {
     echo
     echo -e "    ${DIM}# Full sync with remote${NC}"
     echo -e "    bgit sync"
+    echo
+    echo -e "    ${DIM}# Stay current${NC}"
+    echo -e "    bgit update --check    ${DIM}# just check, don't install${NC}"
+    echo -e "    bgit update             ${DIM}# install the latest version${NC}"
     echo
     echo -e "  ${BOLD}${CYAN}PASS-THROUGH${NC}"
     echo -e "    Any unrecognized command is passed directly to ${BOLD}git${NC}."
@@ -1156,6 +1317,7 @@ main() {
         undo)       cmd_undo "$@" ;;
         whoami)     cmd_whoami "$@" ;;
         config)     cmd_config "$@" ;;
+        update)     cmd_update "$@" ;;
         version|-v|--version) cmd_version "$@" ;;
         help|-h|--help) cmd_help "$@" ;;
         *)
