@@ -10,19 +10,23 @@
 
 set -uo pipefail
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 
-# ─── Colors ─────────────────────────────────────────────────────────────────
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-GRAY='\033[0;90m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# ─── Colors (respect NO_COLOR and non-tty output) ──────────────────────────
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    PURPLE='\033[0;35m'
+    CYAN='\033[0;36m'
+    GRAY='\033[0;90m'
+    BOLD='\033[1m'
+    DIM='\033[2m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' PURPLE='' CYAN='' GRAY='' BOLD='' DIM='' NC=''
+fi
 
 # ─── Icons ──────────────────────────────────────────────────────────────────
 CHECK="✅"
@@ -31,12 +35,11 @@ WARN="⚠️"
 INFO="ℹ️"
 ROCKET="🚀"
 BRANCH_ICON="🌿"
-MERGE_ICON="🔀"
 CONFLICT_ICON="💥"
 PUSH_ICON="⬆️"
 PULL_ICON="⬇️"
-SPARKLE="✨"
-LOCK="🔒"
+TAG_ICON="🏷️"
+CLEAN_ICON="🧹"
 
 # ─── Print Helpers ──────────────────────────────────────────────────────────
 print_info()    { echo -e "${BLUE}${INFO}${NC}  $1"; }
@@ -56,6 +59,14 @@ require_git() {
     fi
 }
 
+require_repo() {
+    if ! in_git_repo; then
+        print_error "Not inside a Git repository."
+        print_info  "Run ${BOLD}bgit init${NC} to create one."
+        exit 1
+    fi
+}
+
 in_git_repo() {
     git rev-parse --is-inside-work-tree &>/dev/null
 }
@@ -64,21 +75,29 @@ current_branch() {
     git branch --show-current 2>/dev/null || echo "detached"
 }
 
-# Get list of files with conflict markers
 conflicted_files() {
     git diff --name-only --diff-filter=U 2>/dev/null
 }
 
-# Check if any conflicts exist
 has_conflicts() {
     local count
     count=$(git diff --name-only --diff-filter=U 2>/dev/null | wc -l)
     [[ "$count" -gt 0 ]]
 }
 
-# Run a git command, capturing output quietly
 git_quiet() {
     git "$@" 2>/dev/null
+}
+
+# Returns ahead,behind for current branch vs its upstream (empty if none)
+ahead_behind() {
+    local up
+    up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
+    [[ -z "$up" ]] && return 1
+    local a b
+    a=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
+    b=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+    echo "${a} ${b}"
 }
 
 # ─── Command: init ──────────────────────────────────────────────────────────
@@ -91,8 +110,6 @@ cmd_init() {
     git init
     print_success "Repository initialized in $(pwd)"
     print_step "Setting up sensible defaults..."
-    git_quiet config user.name 2>/dev/null || true
-    # Set friendly defaults
     git config init.defaultBranch main 2>/dev/null || true
     git config pull.rebase false 2>/dev/null || true
     print_success "Defaults configured."
@@ -105,28 +122,33 @@ cmd_init() {
 
 # ─── Command: status ────────────────────────────────────────────────────────
 cmd_status() {
-    print_header "Repository Status"
+    require_repo
+    local compact=false
+    [[ "${1:-}" == "-s" || "${1:-}" == "--short" ]] && compact=true
 
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        print_info  "Run ${BOLD}bgit init${NC} to create one."
-        exit 1
+    local branch ab a="" b=""
+    branch=$(current_branch)
+
+    if [[ "$compact" == true ]]; then
+        local staged modified untracked
+        staged=$(git diff --cached --name-only 2>/dev/null | wc -l)
+        modified=$(git diff --name-only 2>/dev/null | wc -l)
+        untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l)
+        if ab=$(ahead_behind); then read -r a b <<< "$ab"; fi
+        local ab_str=""
+        [[ -n "$a" ]] && [[ "$a" -gt 0 || "$b" -gt 0 ]] && ab_str=" ${PUSH_ICON}${a} ${PULL_ICON}${b}"
+        echo -e "${BRANCH_ICON} ${BOLD}${branch}${NC}${ab_str}  ${GREEN}+${staged}${NC} ${YELLOW}~${modified}${NC} ${GRAY}?${untracked}${NC}"
+        has_conflicts && echo -e "${RED}${CONFLICT_ICON} $(conflicted_files | wc -l) conflict(s)${NC}"
+        return 0
     fi
 
-    local branch
-    branch=$(current_branch)
+    print_header "Repository Status"
     echo -e "  ${BRANCH_ICON} Branch: ${BOLD}${branch}${NC}"
 
-    local upstream
-    upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
-    if [[ -n "$upstream" ]]; then
-        echo -e "  ${PULL_ICON} Tracking: ${upstream}"
-        # Ahead / behind
-        local ahead behind
-        ahead=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
-        behind=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
-        if [[ "$ahead" -gt 0 ]] || [[ "$behind" -gt 0 ]]; then
-            echo -e "  ${PUSH_ICON} Ahead by ${BOLD}${ahead}${NC}  ${PULL_ICON} Behind by ${BOLD}${behind}${NC}"
+    if ab=$(ahead_behind); then
+        read -r a b <<< "$ab"
+        if [[ "$a" -gt 0 ]] || [[ "$b" -gt 0 ]]; then
+            echo -e "  ${PUSH_ICON} Ahead by ${BOLD}${a}${NC}  ${PULL_ICON} Behind by ${BOLD}${b}${NC}"
         else
             print_success "Up to date with remote."
         fi
@@ -135,29 +157,30 @@ cmd_status() {
     fi
     echo
 
-    # Staged
     local staged
     staged=$(git diff --cached --name-only 2>/dev/null)
     if [[ -n "$staged" ]]; then
         echo -e "  ${GREEN}${BOLD}Staged files:${NC}"
         while IFS= read -r f; do
-            echo -e "    ${GREEN}+${NC} $f"
+            local stat
+            stat=$(git diff --cached --numstat -- "$f" 2>/dev/null | awk '{printf "+%s -%s", $1, $2}')
+            echo -e "    ${GREEN}+${NC} $f  ${DIM}${stat}${NC}"
         done <<< "$staged"
         echo
     fi
 
-    # Modified (unstaged)
     local modified
     modified=$(git diff --name-only 2>/dev/null)
     if [[ -n "$modified" ]]; then
         echo -e "  ${YELLOW}${BOLD}Modified (unstaged):${NC}"
         while IFS= read -r f; do
-            echo -e "    ${YELLOW}~${NC} $f"
+            local stat
+            stat=$(git diff --numstat -- "$f" 2>/dev/null | awk '{printf "+%s -%s", $1, $2}')
+            echo -e "    ${YELLOW}~${NC} $f  ${DIM}${stat}${NC}"
         done <<< "$modified"
         echo
     fi
 
-    # Untracked
     local untracked
     untracked=$(git ls-files --others --exclude-standard 2>/dev/null)
     if [[ -n "$untracked" ]]; then
@@ -168,7 +191,6 @@ cmd_status() {
         echo
     fi
 
-    # Conflicts
     if has_conflicts; then
         echo -e "  ${RED}${BOLD}${CONFLICT_ICON} Conflicted files:${NC}"
         conflicted_files | while IFS= read -r f; do
@@ -180,19 +202,46 @@ cmd_status() {
         return
     fi
 
-    # Clean state
     if [[ -z "$staged" ]] && [[ -z "$modified" ]] && [[ -z "$untracked" ]]; then
         print_success "Working tree is clean. Nothing to do. 🎉"
     fi
 }
 
+# ─── Command: diff ──────────────────────────────────────────────────────────
+cmd_diff() {
+    require_repo
+    local staged=false
+    [[ "${1:-}" == "--staged" || "${1:-}" == "--cached" ]] && staged=true
+
+    print_header "$([[ "$staged" == true ]] && echo "Staged Diff" || echo "Working Tree Diff")"
+
+    local summary
+    if [[ "$staged" == true ]]; then
+        summary=$(git diff --cached --stat 2>/dev/null)
+    else
+        summary=$(git diff --stat 2>/dev/null)
+    fi
+
+    if [[ -z "$summary" ]]; then
+        print_info "No changes to show."
+        return 0
+    fi
+
+    echo "$summary" | sed -E "s/^(.*\|.*\+.*)$/  \1/" | while IFS= read -r line; do
+        if [[ "$line" =~ \| ]]; then
+            echo -e "  ${CYAN}${line}${NC}"
+        else
+            echo -e "  ${DIM}${line}${NC}"
+        fi
+    done
+    echo
+    print_info "Run ${BOLD}git diff$([[ "$staged" == true ]] && echo " --cached")${NC} for the full line-by-line diff."
+}
+
 # ─── Command: add ───────────────────────────────────────────────────────────
 cmd_add() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local target="${1:-.}"
 
@@ -216,10 +265,7 @@ cmd_add() {
 # ─── Command: commit ────────────────────────────────────────────────────────
 cmd_commit() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local message=""
     local auto_stage=false
@@ -227,24 +273,15 @@ cmd_commit() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -m|--message)
-                message="$2"
-                shift 2
-                ;;
-            -a|--all)
-                auto_stage=true
-                shift
-                ;;
+            -m|--message) message="$2"; shift 2 ;;
+            -a|--all)     auto_stage=true; shift ;;
             *)
-                if [[ -z "$message" ]]; then
-                    message="$1"
-                fi
+                [[ -z "$message" ]] && message="$1"
                 shift
                 ;;
         esac
     done
 
-    # Auto-stage if requested or if nothing is staged
     local staged_count
     staged_count=$(git diff --cached --name-only 2>/dev/null | wc -l)
     if [[ "$staged_count" -eq 0 ]] || [[ "$auto_stage" == true ]]; then
@@ -258,7 +295,6 @@ cmd_commit() {
         return 0
     fi
 
-    # If no message provided, generate one
     if [[ -z "$message" ]]; then
         print_step "No commit message provided — generating one..."
         message=$(generate_commit_message)
@@ -267,14 +303,9 @@ cmd_commit() {
         read -rp "$(echo -e "${BLUE}${INFO}${NC}  Use this message? [Y/n/edit] ")" choice
         choice=${choice:-Y}
         case "${choice,,}" in
-            y|yes)
-                ;;
-            e|edit)
-                read -rp "Enter your commit message: " message
-                ;;
-            *)
-                read -rp "Enter your commit message: " message
-                ;;
+            y|yes) ;;
+            e|edit) read -rp "Enter your commit message: " message ;;
+            *) read -rp "Enter your commit message: " message ;;
         esac
     fi
 
@@ -288,14 +319,58 @@ cmd_commit() {
     fi
 }
 
+# ─── Command: amend ─────────────────────────────────────────────────────────
+cmd_amend() {
+    require_git
+    require_repo
+
+    if ! git log -1 &>/dev/null; then
+        print_error "No commits yet — nothing to amend."
+        exit 1
+    fi
+
+    local message=""
+    local no_edit=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--message) message="$2"; shift 2 ;;
+            --no-edit) no_edit=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    # Stage any pending changes too — amend usually means "fold this in"
+    local staged_count
+    staged_count=$(git diff --cached --name-only 2>/dev/null | wc -l)
+    local unstaged_count
+    unstaged_count=$(git diff --name-only 2>/dev/null | wc -l)
+    if [[ "$staged_count" -eq 0 ]] && [[ "$unstaged_count" -gt 0 ]]; then
+        print_step "Staging modified files for amend..."
+        git add -u
+    fi
+
+    print_header "Amending last commit"
+    print_dim "  Was: $(git log -1 --oneline)"
+
+    if [[ -n "$message" ]]; then
+        git commit --amend -m "$message"
+    elif [[ "$no_edit" == true ]]; then
+        git commit --amend --no-edit
+    else
+        git commit --amend --no-edit
+    fi
+
+    print_success "Amended."
+    print_dim "  Now: $(git log -1 --oneline)"
+    print_warn "If this commit was already pushed, you'll need: bgit push --force"
+}
+
 # Generate a simple commit message from the diff
 generate_commit_message() {
     local staged
     staged=$(git diff --cached --name-only 2>/dev/null)
 
-    local added=0
-    local modified=0
-    local deleted=0
+    local added=0 modified=0 deleted=0 renamed=0
     while IFS= read -r f; do
         local status
         status=$(git diff --cached --name-status -- "$f" 2>/dev/null | head -1 | cut -c1)
@@ -303,6 +378,7 @@ generate_commit_message() {
             A) added=$((added + 1)) ;;
             M) modified=$((modified + 1)) ;;
             D) deleted=$((deleted + 1)) ;;
+            R) renamed=$((renamed + 1)) ;;
             *) modified=$((modified + 1)) ;;
         esac
     done <<< "$staged"
@@ -311,22 +387,18 @@ generate_commit_message() {
     [[ $added -gt 0 ]]    && parts+=("add $added file(s)")
     [[ $modified -gt 0 ]] && parts+=("update $modified file(s)")
     [[ $deleted -gt 0 ]]  && parts+=("remove $deleted file(s)")
+    [[ $renamed -gt 0 ]]  && parts+=("rename $renamed file(s)")
 
     local action="update"
-    if [[ $added -gt 0 ]] && [[ $modified -eq 0 ]] && [[ $deleted -eq 0 ]]; then
+    if [[ $added -gt 0 ]] && [[ $modified -eq 0 ]] && [[ $deleted -eq 0 ]] && [[ $renamed -eq 0 ]]; then
         action="add"
-    elif [[ $deleted -gt 0 ]] && [[ $added -eq 0 ]] && [[ $modified -eq 0 ]]; then
+    elif [[ $deleted -gt 0 ]] && [[ $added -eq 0 ]] && [[ $modified -eq 0 ]] && [[ $renamed -eq 0 ]]; then
         action="remove"
     fi
 
-    # Try to guess scope from most common directory
     local scope=""
-    scope=$(echo "$staged" | sed 's|/.*||' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
-    if [[ -n "$scope" ]] && [[ "$scope" != "$(echo "$staged" | head -1)" ]]; then
-        scope="($scope)"
-    else
-        scope=""
-    fi
+    scope=$(echo "$staged" | grep -F / | sed 's|/.*||' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+    [[ -n "$scope" ]] && scope="($scope)"
 
     echo "${action}${scope}: $(IFS=', '; echo "${parts[*]}")"
 }
@@ -334,27 +406,17 @@ generate_commit_message() {
 # ─── Command: push ──────────────────────────────────────────────────────────
 cmd_push() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local force=false
     local args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -f|--force)
-                force=true
-                shift
-                ;;
-            *)
-                args+=("$1")
-                shift
-                ;;
+            -f|--force) force=true; shift ;;
+            *) args+=("$1"); shift ;;
         esac
     done
 
-    # Check for unpushed commits
     local upstream
     upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
 
@@ -380,14 +442,15 @@ cmd_push() {
     fi
 
     print_header "Pushing to ${upstream}"
+    local result=0
     if [[ "$force" == true ]]; then
-        print_warn "Force push enabled."
-        git push --force-with-lease "${args[@]}"
+        print_warn "Force push enabled (using --force-with-lease for safety)."
+        git push --force-with-lease "${args[@]}" || result=$?
     else
-        git push "${args[@]}"
+        git push "${args[@]}" || result=$?
     fi
 
-    if [[ $? -eq 0 ]]; then
+    if [[ "$result" -eq 0 ]]; then
         print_success "Pushed ${ahead} commit(s) successfully!"
     else
         print_error "Push failed."
@@ -398,10 +461,7 @@ cmd_push() {
 # ─── Command: pull ──────────────────────────────────────────────────────────
 cmd_pull() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local upstream
     upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo "")
@@ -414,7 +474,6 @@ cmd_pull() {
 
     print_header "Pulling from ${upstream}"
 
-    # Check for local changes first
     local stashed=false
     if ! git diff --quiet || ! git diff --cached --quiet; then
         print_warn "You have uncommitted changes. Stashing them temporarily..."
@@ -439,7 +498,6 @@ cmd_pull() {
         fi
     fi
 
-    # Restore stash if we stashed
     if [[ "$stashed" == true ]]; then
         print_step "Restoring your stashed changes..."
         if git stash pop; then
@@ -453,10 +511,7 @@ cmd_pull() {
 # ─── Command: merge ─────────────────────────────────────────────────────────
 cmd_merge() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     if [[ $# -eq 0 ]]; then
         print_error "Please specify a branch to merge."
@@ -470,19 +525,13 @@ cmd_merge() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --ours|--theirs|--union)
-                strategy="$1"
-                shift
-                ;;
-            *)
-                shift
-                ;;
+            --ours|--theirs|--union) strategy="$1"; shift ;;
+            *) shift ;;
         esac
     done
 
     print_header "Merging '${target}' into '$(current_branch)'"
 
-    # Make sure working tree is clean
     local stashed=false
     if ! git diff --quiet || ! git diff --cached --quiet; then
         print_warn "Working tree is not clean. Stashing changes..."
@@ -517,15 +566,11 @@ cmd_merge() {
 }
 
 # ─── Command: resolve ───────────────────────────────────────────────────────
-# Auto-resolve merge conflicts
 resolve_with_strategy() {
     local strategy="$1"
     local files
     files=$(conflicted_files)
-
-    if [[ -z "$files" ]]; then
-        return 0
-    fi
+    [[ -z "$files" ]] && return 0
 
     while IFS= read -r file; do
         [[ -z "$file" ]] && continue
@@ -541,9 +586,7 @@ resolve_with_strategy() {
             --union)
                 if [[ -f "$file" ]]; then
                     git merge-file --union -p "$file" "$file" "$file" 2>/dev/null > "${file}.resolved" || true
-                    if [[ -f "${file}.resolved" ]]; then
-                        mv "${file}.resolved" "$file"
-                    fi
+                    [[ -f "${file}.resolved" ]] && mv "${file}.resolved" "$file"
                 fi
                 print_step "Resolved (union):  $file"
                 ;;
@@ -554,35 +597,18 @@ resolve_with_strategy() {
 
 cmd_resolve() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local strategy=""
     local auto=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --ours)
-                strategy="--ours"
-                shift
-                ;;
-            --theirs)
-                strategy="--theirs"
-                shift
-                ;;
-            --union)
-                strategy="--union"
-                shift
-                ;;
-            --auto)
-                auto=true
-                shift
-                ;;
-            *)
-                shift
-                ;;
+            --ours) strategy="--ours"; shift ;;
+            --theirs) strategy="--theirs"; shift ;;
+            --union) strategy="--union"; shift ;;
+            --auto) auto=true; shift ;;
+            *) shift ;;
         esac
     done
 
@@ -604,10 +630,8 @@ cmd_resolve() {
     done <<< "$files"
     echo
 
-    local choice=""
-    local fchoice=""
+    local choice="" fchoice=""
 
-    # If no strategy and not auto, ask interactively
     if [[ -z "$strategy" ]] && [[ "$auto" == false ]]; then
         echo -e "  ${BOLD}Choose a resolution strategy:${NC}"
         echo -e "    ${CYAN}1${NC}) Keep MY changes        (--ours)"
@@ -654,22 +678,16 @@ cmd_resolve() {
                 print_info "Run ${BOLD}bgit commit${NC} to finalize."
                 return 0
                 ;;
-            *)
-                print_warn "Cancelled."
-                return 0
-                ;;
+            *) print_warn "Cancelled."; return 0 ;;
         esac
     fi
 
-    # If auto with no strategy, try smart resolution
     if [[ "$auto" == true ]] && [[ -z "$strategy" ]]; then
         strategy="--ours"
         print_step "Auto-mode: defaulting to keep your changes (--ours)."
     fi
 
-    if [[ -n "$strategy" ]]; then
-        resolve_with_strategy "$strategy"
-    fi
+    [[ -n "$strategy" ]] && resolve_with_strategy "$strategy"
 
     if has_conflicts; then
         print_warn "Some files could not be auto-resolved."
@@ -716,22 +734,24 @@ cmd_clone() {
 # ─── Command: branch ────────────────────────────────────────────────────────
 cmd_branch() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     if [[ $# -eq 0 ]]; then
         print_header "Branches"
         local current
         current=$(current_branch)
-        git branch | while IFS= read -r line; do
-            line="${line//\*/ }"
-            line="$(echo "$line" | xargs)"
-            if [[ "$line" == "$current" ]]; then
-                echo -e "  ${GREEN}${BRANCH_ICON} * ${BOLD}${line}${NC}"
+        git for-each-ref --format='%(refname:short)' refs/heads/ | while IFS= read -r b; do
+            local upstream a=0 bnum=0 abstr=""
+            upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "${b}@{u}" 2>/dev/null || echo "")
+            if [[ -n "$upstream" ]]; then
+                a=$(git rev-list --count "${upstream}..${b}" 2>/dev/null || echo 0)
+                bnum=$(git rev-list --count "${b}..${upstream}" 2>/dev/null || echo 0)
+                [[ "$a" -gt 0 || "$bnum" -gt 0 ]] && abstr=" ${DIM}(${PUSH_ICON}${a} ${PULL_ICON}${bnum})${NC}"
+            fi
+            if [[ "$b" == "$current" ]]; then
+                echo -e "  ${GREEN}${BRANCH_ICON} * ${BOLD}${b}${NC}${abstr}"
             else
-                echo -e "  ${GRAY}   ${line}${NC}"
+                echo -e "  ${GRAY}   ${b}${NC}${abstr}"
             fi
         done
         return
@@ -775,13 +795,35 @@ cmd_branch() {
     esac
 }
 
+# ─── Command: recent (recently visited branches) ───────────────────────────
+cmd_recent() {
+    require_git
+    require_repo
+
+    local count="${1:-8}"
+    print_header "Recently Visited Branches"
+
+    git reflog show --pretty='%gs' 2>/dev/null \
+        | grep -oE 'checkout: moving from [^ ]+ to [^ ]+' \
+        | awk '{print $NF}' \
+        | awk '!seen[$0]++' \
+        | head -n "$count" \
+        | while IFS= read -r b; do
+            if [[ "$b" == "$(current_branch)" ]]; then
+                echo -e "  ${GREEN}${BRANCH_ICON} * ${BOLD}${b}${NC} ${DIM}(current)${NC}"
+            else
+                echo -e "  ${GRAY}   ${b}${NC}"
+            fi
+        done
+
+    echo
+    print_info "Switch with: ${BOLD}bgit branch switch <name>${NC}"
+}
+
 # ─── Command: log ───────────────────────────────────────────────────────────
 cmd_log() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local count="${1:-15}"
     print_header "Recent Commits"
@@ -793,10 +835,7 @@ cmd_log() {
 # ─── Command: stash ─────────────────────────────────────────────────────────
 cmd_stash() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local action="${1:-list}"
 
@@ -828,13 +867,107 @@ cmd_stash() {
     esac
 }
 
+# ─── Command: tag ───────────────────────────────────────────────────────────
+cmd_tag() {
+    require_git
+    require_repo
+
+    if [[ $# -eq 0 ]]; then
+        print_header "Tags"
+        local tags
+        tags=$(git tag --sort=-creatordate 2>/dev/null)
+        if [[ -z "$tags" ]]; then
+            print_info "No tags yet."
+            print_dim "  bgit tag new v1.0.0  — create one"
+        else
+            echo "$tags" | while IFS= read -r t; do
+                local msg
+                msg=$(git tag -l --format='%(subject)' "$t" 2>/dev/null)
+                echo -e "  ${TAG_ICON} ${BOLD}${t}${NC}${msg:+  ${DIM}${msg}${NC}}"
+            done
+        fi
+        return
+    fi
+
+    local action="$1"
+    local name="${2:-}"
+
+    case "$action" in
+        new|create)
+            if [[ -z "$name" ]]; then
+                print_error "Please provide a tag name."
+                return 1
+            fi
+            local msg=""
+            read -rp "$(echo -e "${BLUE}${INFO}${NC}  Tag message (optional): ")" msg
+            print_header "Creating tag '${name}'"
+            if [[ -n "$msg" ]]; then
+                git tag -a "$name" -m "$msg"
+            else
+                git tag "$name"
+            fi
+            print_success "Tagged current commit as '${name}'"
+            print_dim "  Push it with: bgit push origin ${name}"
+            ;;
+        delete|rm)
+            if [[ -z "$name" ]]; then
+                print_error "Please provide a tag name."
+                return 1
+            fi
+            git tag -d "$name"
+            print_success "Deleted tag '${name}'"
+            ;;
+        *)
+            print_error "Unknown tag action: $action"
+            print_info  "Usage: bgit tag [new|delete] [name]"
+            ;;
+    esac
+}
+
+# ─── Command: clean ─────────────────────────────────────────────────────────
+cmd_clean() {
+    require_git
+    require_repo
+
+    local force=false
+    [[ "${1:-}" == "-f" || "${1:-}" == "--force" ]] && force=true
+
+    print_header "Cleaning Untracked Files"
+
+    local files
+    files=$(git clean -nd 2>/dev/null | sed 's/^Would remove //')
+
+    if [[ -z "$files" ]]; then
+        print_success "Nothing to clean. Working tree is already tidy."
+        return 0
+    fi
+
+    echo -e "  ${BOLD}The following would be removed:${NC}"
+    echo "$files" | while IFS= read -r f; do
+        echo -e "    ${RED}${CLEAN_ICON}${NC} $f"
+    done
+    echo
+
+    if [[ "$force" == true ]]; then
+        git clean -fd
+        print_success "Cleaned."
+        return 0
+    fi
+
+    local confirm=""
+    read -rp "$(echo -e "${YELLOW}${WARN}${NC}  Delete these files? This cannot be undone. [y/N] ")" confirm
+    if [[ "${confirm,,}" == "y" ]]; then
+        git clean -fd
+        print_success "Cleaned."
+    else
+        print_info "Cancelled."
+    fi
+}
+
 # ─── Command: sync ──────────────────────────────────────────────────────────
 cmd_sync() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     print_header "Syncing with Remote"
     print_step "Pulling latest changes..."
@@ -848,10 +981,7 @@ cmd_sync() {
 # ─── Command: undo ──────────────────────────────────────────────────────────
 cmd_undo() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     local type="${1:-last}"
     local confirm=""
@@ -885,13 +1015,26 @@ cmd_undo() {
     esac
 }
 
+# ─── Command: whoami ────────────────────────────────────────────────────────
+cmd_whoami() {
+    require_git
+    require_repo
+
+    local name email branch remote ab a="" b=""
+    name=$(git config user.name 2>/dev/null || echo "(not set)")
+    email=$(git config user.email 2>/dev/null || echo "(not set)")
+    branch=$(current_branch)
+    remote=$(git remote get-url origin 2>/dev/null || echo "(none)")
+
+    echo -e "  ${BOLD}${name}${NC} ${DIM}<${email}>${NC}"
+    echo -e "  ${BRANCH_ICON} ${branch}$( ab=$(ahead_behind) && { read -r a b <<< "$ab"; [[ "$a" -gt 0 || "$b" -gt 0 ]] && echo -n " ${PUSH_ICON}${a} ${PULL_ICON}${b}"; } )"
+    echo -e "  ${DIM}${remote}${NC}"
+}
+
 # ─── Command: config ────────────────────────────────────────────────────────
 cmd_config() {
     require_git
-    if ! in_git_repo; then
-        print_error "Not inside a Git repository."
-        exit 1
-    fi
+    require_repo
 
     print_header "Git Configuration"
     local name email
@@ -923,22 +1066,33 @@ cmd_help() {
     echo -e "  ${BOLD}${CYAN}USAGE${NC}"
     echo -e "    bgit <command> [options]"
     echo
-    echo -e "  ${BOLD}${CYAN}COMMANDS${NC}"
-    echo
-    echo -e "    ${BOLD}init${NC}              Initialize a new Git repository"
-    echo -e "    ${BOLD}status${NC}            Show a clean summary of repo state"
+    echo -e "  ${BOLD}${CYAN}EVERYDAY${NC}"
+    echo -e "    ${BOLD}status${NC} [-s]       Show repo state (-s for one-line summary)"
+    echo -e "    ${BOLD}diff${NC} [--staged]   Show a clean change summary"
     echo -e "    ${BOLD}add${NC} [file|.]      Stage files (default: all)"
     echo -e "    ${BOLD}commit${NC} [-m msg]   Commit staged changes (auto-generates message)"
+    echo -e "    ${BOLD}amend${NC} [-m msg]    Amend the last commit"
     echo -e "    ${BOLD}push${NC} [-f]         Push to remote (auto-sets upstream)"
     echo -e "    ${BOLD}pull${NC}              Pull from remote (auto-stashes, auto-resolves)"
+    echo -e "    ${BOLD}sync${NC}              Pull + push in one step"
+    echo
+    echo -e "  ${BOLD}${CYAN}BRANCHES${NC}"
+    echo -e "    ${BOLD}branch${NC} [action]   List/create/delete/switch branches"
+    echo -e "    ${BOLD}recent${NC} [n]        Recently visited branches"
     echo -e "    ${BOLD}merge${NC} <branch>    Merge a branch (auto-resolves conflicts)"
     echo -e "    ${BOLD}resolve${NC} [strategy] Auto-resolve merge conflicts"
-    echo -e "    ${BOLD}clone${NC} <url>       Clone a repository"
-    echo -e "    ${BOLD}branch${NC} [action]   List/create/delete/switch branches"
+    echo
+    echo -e "  ${BOLD}${CYAN}HISTORY & CLEANUP${NC}"
     echo -e "    ${BOLD}log${NC} [n]           Show recent commits (default: 15)"
     echo -e "    ${BOLD}stash${NC} [action]    Save/pop/list stashed changes"
-    echo -e "    ${BOLD}sync${NC}              Pull + push in one step"
+    echo -e "    ${BOLD}tag${NC} [action]      List/create/delete tags"
+    echo -e "    ${BOLD}clean${NC} [-f]        Remove untracked files (asks first)"
     echo -e "    ${BOLD}undo${NC} [type]       Undo last commit / hard reset / unstage"
+    echo
+    echo -e "  ${BOLD}${CYAN}SETUP & INFO${NC}"
+    echo -e "    ${BOLD}init${NC}              Initialize a new Git repository"
+    echo -e "    ${BOLD}clone${NC} <url>       Clone a repository"
+    echo -e "    ${BOLD}whoami${NC}            Quick identity + branch + remote summary"
     echo -e "    ${BOLD}config${NC}            Show git configuration"
     echo -e "    ${BOLD}version${NC}           Show BGit version"
     echo -e "    ${BOLD}help${NC}              Show this help message"
@@ -953,6 +1107,9 @@ cmd_help() {
     echo -e "    ${DIM}# Start a new project${NC}"
     echo -e "    bgit init && bgit add . && bgit commit -m \"Initial commit\""
     echo
+    echo -e "    ${DIM}# Quick glance before standup${NC}"
+    echo -e "    bgit status -s"
+    echo
     echo -e "    ${DIM}# Resolve conflicts keeping your changes${NC}"
     echo -e "    bgit resolve --ours"
     echo
@@ -962,6 +1119,8 @@ cmd_help() {
     echo -e "  ${BOLD}${CYAN}PASS-THROUGH${NC}"
     echo -e "    Any unrecognized command is passed directly to ${BOLD}git${NC}."
     echo -e "    ${DIM}bgit rebase -i HEAD~3${NC}  →  ${DIM}git rebase -i HEAD~3${NC}"
+    echo
+    echo -e "  ${DIM}Set NO_COLOR=1 to disable colored output.${NC}"
     echo
 }
 
@@ -978,18 +1137,24 @@ main() {
     case "$command" in
         init)       cmd_init "$@" ;;
         status|st)  cmd_status "$@" ;;
+        diff|d)     cmd_diff "$@" ;;
         add)        cmd_add "$@" ;;
         commit|ci)  cmd_commit "$@" ;;
+        amend)      cmd_amend "$@" ;;
         push)       cmd_push "$@" ;;
         pull)       cmd_pull "$@" ;;
         merge)      cmd_merge "$@" ;;
         resolve)    cmd_resolve "$@" ;;
         clone)      cmd_clone "$@" ;;
         branch|br)  cmd_branch "$@" ;;
+        recent)     cmd_recent "$@" ;;
         log)        cmd_log "$@" ;;
         stash)      cmd_stash "$@" ;;
+        tag)        cmd_tag "$@" ;;
+        clean)      cmd_clean "$@" ;;
         sync)       cmd_sync "$@" ;;
         undo)       cmd_undo "$@" ;;
+        whoami)     cmd_whoami "$@" ;;
         config)     cmd_config "$@" ;;
         version|-v|--version) cmd_version "$@" ;;
         help|-h|--help) cmd_help "$@" ;;
